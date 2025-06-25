@@ -1,0 +1,430 @@
+# =============================================================================
+# .github/workflows/etl-pipeline.yml
+# =============================================================================
+name: 🏛️ Czech Parliament ETL Pipeline
+
+on:
+  schedule:
+    # Daily incremental sync at 6:00 AM UTC (8:00 AM Prague time)
+    - cron: '0 6 * * *'
+    # Weekly full sync on Sundays at 2:00 AM UTC (4:00 AM Prague time)  
+    - cron: '0 2 * * 0'
+    # Health check every 6 hours
+    - cron: '0 */6 * * *'
+  
+  workflow_dispatch: # Allow manual triggers
+    inputs:
+      sync_type:
+        description: 'Type of sync to run'
+        required: true
+        default: 'incremental'
+        type: choice
+        options:
+        - incremental
+        - full
+        - health-check
+        - test-connection
+      
+      force_refresh:
+        description: 'Force refresh all data (ignore cache)'
+        required: false
+        type: boolean
+        default: false
+      
+      notification_level:
+        description: 'Notification level'
+        required: false
+        default: 'errors-only'
+        type: choice
+        options:
+        - all
+        - errors-only
+        - none
+
+  push:
+    branches: [ main ]
+    paths: 
+    - 'etl/**'
+    - '.github/workflows/etl-pipeline.yml'
+env:
+  PYTHON_VERSION: '3.11'
+  TZ: 'Europe/Prague'
+
+jobs:
+  # =============================================================================
+  # JOB 1: Health Check (runs on every trigger)
+  # =============================================================================
+  health-check:
+    name: 🔍 System Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      system-healthy: ${{ steps.health.outputs.healthy }}
+      last-sync: ${{ steps.health.outputs.last_sync }}
+      
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+        
+    - name: 📦 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🏥 Run health check
+      id: health
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      run: |
+        echo "🔍 Running system health check..."
+        
+        # Run health check and capture output
+        python etl_pipeline.py --database-url "$DATABASE_URL" --action monitor > health_output.txt 2>&1
+        
+        # Parse health check results
+        if grep -q "healthy" health_output.txt; then
+          echo "healthy=true" >> $GITHUB_OUTPUT
+          echo "✅ System is healthy"
+        else
+          echo "healthy=false" >> $GITHUB_OUTPUT
+          echo "⚠️ System health issues detected"
+        fi
+        
+        # Extract last sync info
+        last_sync=$(grep -oP "latest_vote_date.*\K\d{4}-\d{2}-\d{2}" health_output.txt || echo "unknown")
+        echo "last_sync=$last_sync" >> $GITHUB_OUTPUT
+        
+        # Show health output
+        cat health_output.txt
+        
+    - name: 📊 Create health summary
+      if: always()
+      run: |
+        echo "## 🏥 Health Check Summary" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| System Health | ${{ steps.health.outputs.healthy == 'true' && '✅ Healthy' || '⚠️ Issues' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Last Sync | ${{ steps.health.outputs.last_sync }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Check Time | $(date '+%Y-%m-%d %H:%M:%S %Z') |" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================================  
+  # JOB 2: ETL Sync (conditional based on health check)
+  # =============================================================================
+  etl-sync:
+    name: 📊 ETL Data Sync
+    runs-on: ubuntu-latest
+    needs: health-check
+    timeout-minutes: 30
+    if: ${{ github.event_name != 'schedule' || needs.health-check.outputs.system-healthy == 'true' || github.event.schedule == '0 2 * * 0' }}
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+        
+    - name: 📦 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🎯 Determine sync type
+      id: sync_type
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          SYNC_TYPE="${{ github.event.inputs.sync_type }}"
+        elif [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${{ github.event.schedule }}" = "0 2 * * 0" ]; then
+            SYNC_TYPE="full"
+          elif [ "${{ github.event.schedule }}" = "0 */6 * * *" ]; then
+            SYNC_TYPE="health-check"
+          else
+            SYNC_TYPE="incremental"
+          fi
+        elif [ "${{ github.event_name }}" = "push" ]; then
+          SYNC_TYPE="test-connection"
+        else
+          SYNC_TYPE="incremental"
+        fi
+        
+        echo "type=$SYNC_TYPE" >> $GITHUB_OUTPUT
+        echo "🎯 Sync type determined: $SYNC_TYPE"
+        
+    - name: 🧪 Test database connection
+      if: steps.sync_type.outputs.type == 'test-connection' || steps.sync_type.outputs.type == 'health-check'
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      run: |
+        echo "🔌 Testing database connection..."
+        python -c "
+        import asyncio
+        import asyncpg
+        import os
+        
+        async def test_connection():
+            try:
+                conn = await asyncpg.connect(os.environ['DATABASE_URL'])
+                result = await conn.fetchval('SELECT COUNT(*) FROM mps WHERE is_active = true')
+                await conn.close()
+                print(f'✅ Database connection successful. Active MPs: {result}')
+                return True
+            except Exception as e:
+                print(f'❌ Database connection failed: {e}')
+                return False
+        
+        success = asyncio.run(test_connection())
+        exit(0 if success else 1)
+        "
+        
+    - name: 🔄 Run incremental sync
+      if: steps.sync_type.outputs.type == 'incremental'
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        SYNC_TYPE: incremental
+      run: |
+        echo "🔄 Starting incremental sync..."
+        echo "⏰ Started at: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        
+        # Run incremental sync with detailed output
+        python etl_pipeline.py --database-url "$DATABASE_URL" --action incremental-sync | tee sync_output.txt
+        
+        # Extract key metrics
+        PROCESSED=$(grep -oP "records processed: \K\d+" sync_output.txt | tail -1 || echo "0")
+        INSERTED=$(grep -oP "inserted: \K\d+" sync_output.txt | tail -1 || echo "0") 
+        UPDATED=$(grep -oP "updated: \K\d+" sync_output.txt | tail -1 || echo "0")
+        FAILED=$(grep -oP "failed: \K\d+" sync_output.txt | tail -1 || echo "0")
+        
+        echo "PROCESSED=$PROCESSED" >> $GITHUB_ENV
+        echo "INSERTED=$INSERTED" >> $GITHUB_ENV
+        echo "UPDATED=$UPDATED" >> $GITHUB_ENV
+        echo "FAILED=$FAILED" >> $GITHUB_ENV
+        
+        echo "✅ Incremental sync completed"
+        echo "📊 Processed: $PROCESSED, Inserted: $INSERTED, Updated: $UPDATED, Failed: $FAILED"
+        
+    - name: 🔄 Run full sync
+      if: steps.sync_type.outputs.type == 'full'
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        SYNC_TYPE: full
+      run: |
+        echo "🔄 Starting full sync..."
+        echo "⏰ Started at: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        
+        # Run full sync with detailed output
+        python etl_pipeline.py --database-url "$DATABASE_URL" --action full-sync | tee sync_output.txt
+        
+        # Extract key metrics
+        PROCESSED=$(grep -oP "records processed: \K\d+" sync_output.txt | tail -1 || echo "0")
+        INSERTED=$(grep -oP "inserted: \K\d+" sync_output.txt | tail -1 || echo "0")
+        UPDATED=$(grep -oP "updated: \K\d+" sync_output.txt | tail -1 || echo "0") 
+        FAILED=$(grep -oP "failed: \K\d+" sync_output.txt | tail -1 || echo "0")
+        
+        echo "PROCESSED=$PROCESSED" >> $GITHUB_ENV
+        echo "INSERTED=$INSERTED" >> $GITHUB_ENV
+        echo "UPDATED=$UPDATED" >> $GITHUB_ENV
+        echo "FAILED=$FAILED" >> $GITHUB_ENV
+        
+        echo "✅ Full sync completed"
+        echo "📊 Processed: $PROCESSED, Inserted: $INSERTED, Updated: $UPDATED, Failed: $FAILED"
+        
+    - name: 📊 Create sync summary
+      if: steps.sync_type.outputs.type != 'test-connection' && steps.sync_type.outputs.type != 'health-check'
+      run: |
+        echo "## 📊 ETL Sync Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Sync Type:** ${{ steps.sync_type.outputs.type }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Started:** $(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| 📥 Processed | ${PROCESSED:-0} |" >> $GITHUB_STEP_SUMMARY
+        echo "| ➕ Inserted | ${INSERTED:-0} |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🔄 Updated | ${UPDATED:-0} |" >> $GITHUB_STEP_SUMMARY
+        echo "| ❌ Failed | ${FAILED:-0} |" >> $GITHUB_STEP_SUMMARY
+        
+        # Add status indicator
+        if [ "${FAILED:-0}" -eq 0 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Status:** All records processed successfully" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Status:** Some records failed to process" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+    - name: 📤 Upload sync logs
+      if: always() && steps.sync_type.outputs.type != 'test-connection'
+      uses: actions/upload-artifact@v4
+      with:
+        name: sync-logs-${{ steps.sync_type.outputs.type }}-${{ github.run_number }}
+        path: |
+          sync_output.txt
+          health_output.txt
+          etl_pipeline.log
+        retention-days: 30
+
+  # =============================================================================
+  # JOB 3: Data Quality Check (after sync)
+  # =============================================================================
+  data-quality:
+    name: 🔍 Data Quality Check
+    runs-on: ubuntu-latest
+    needs: [health-check, etl-sync]
+    timeout-minutes: 10
+    if: success() && needs.etl-sync.result == 'success'
+    
+    steps:
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+        
+    - name: 📦 Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🔍 Run data quality checks
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      run: |
+        echo "🔍 Running data quality checks..."
+        
+        python -c "
+        import asyncio
+        import asyncpg
+        import os
+        from datetime import datetime, timedelta
+        
+        async def quality_check():
+            conn = await asyncpg.connect(os.environ['DATABASE_URL'])
+            
+            # Check 1: MP count
+            mp_count = await conn.fetchval('SELECT COUNT(*) FROM mps WHERE is_active = true')
+            print(f'Active MPs: {mp_count}')
+            
+            # Check 2: Recent voting sessions
+            recent_votes = await conn.fetchval('''
+                SELECT COUNT(*) FROM voting_sessions 
+                WHERE vote_date > NOW() - INTERVAL '30 days'
+            ''')
+            print(f'Recent votes (30 days): {recent_votes}')
+            
+            # Check 3: Data freshness
+            latest_vote = await conn.fetchval('SELECT MAX(vote_date) FROM voting_sessions')
+            print(f'Latest vote date: {latest_vote}')
+            
+            # Check 4: Sync health
+            recent_sync = await conn.fetchrow('''
+                SELECT sync_type, sync_status, completed_at 
+                FROM data_sync_log 
+                ORDER BY completed_at DESC LIMIT 1
+            ''')
+            
+            if recent_sync:
+                print(f'Last sync: {recent_sync[\"sync_type\"]} - {recent_sync[\"sync_status\"]} at {recent_sync[\"completed_at\"]}')
+            
+            await conn.close()
+            
+            # Quality assertions
+            assert mp_count >= 180, f'MP count too low: {mp_count}'
+            assert recent_votes >= 0, f'No recent voting data'
+            
+            if latest_vote:
+                days_old = (datetime.now().date() - latest_vote).days
+                if days_old > 60:  # Parliament might be in recess
+                    print(f'⚠️ Warning: Latest vote is {days_old} days old')
+            
+            print('✅ All quality checks passed')
+        
+        asyncio.run(quality_check())
+        "
+
+  # =============================================================================
+  # JOB 4: Notifications (runs on completion)
+  # =============================================================================
+  notify:
+    name: 📢 Send Notifications
+    runs-on: ubuntu-latest
+    needs: [health-check, etl-sync, data-quality]
+    if: always() && (failure() || github.event.inputs.notification_level == 'all')
+    timeout-minutes: 5
+    
+    steps:
+    - name: 📢 Send Discord notification
+      if: env.DISCORD_WEBHOOK != ''
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      run: |
+        # Determine status and color
+        if [ "${{ needs.etl-sync.result }}" = "success" ] && [ "${{ needs.data-quality.result }}" = "success" ]; then
+          STATUS="✅ Success"
+          COLOR="3066993"  # Green
+        elif [ "${{ needs.etl-sync.result }}" = "failure" ] || [ "${{ needs.data-quality.result }}" = "failure" ]; then
+          STATUS="❌ Failed" 
+          COLOR="15158332"  # Red
+        else
+          STATUS="⚠️ Warning"
+          COLOR="15105570"  # Orange
+        fi
+        
+        # Create embed message
+        curl -H "Content-Type: application/json" \
+             -X POST \
+             -d "{
+               \"embeds\": [{
+                 \"title\": \"🏛️ Czech Parliament ETL Pipeline\",
+                 \"description\": \"**Status:** $STATUS\n**Trigger:** ${{ github.event_name }}\n**Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')\",
+                 \"color\": $COLOR,
+                 \"fields\": [
+                   {\"name\": \"Health Check\", \"value\": \"${{ needs.health-check.result }}\", \"inline\": true},
+                   {\"name\": \"ETL Sync\", \"value\": \"${{ needs.etl-sync.result }}\", \"inline\": true},
+                   {\"name\": \"Data Quality\", \"value\": \"${{ needs.data-quality.result }}\", \"inline\": true}
+                 ],
+                 \"footer\": {\"text\": \"GitHub Actions • ${{ github.repository }}\"}
+               }]
+             }" \
+             "$DISCORD_WEBHOOK"
+             
+    - name: 📧 Send Slack notification  
+      if: env.SLACK_WEBHOOK != ''
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      run: |
+        # Determine emoji and message
+        if [ "${{ needs.etl-sync.result }}" = "success" ]; then
+          EMOJI=":white_check_mark:"
+          STATUS="Success"
+        else
+          EMOJI=":x:"
+          STATUS="Failed"
+        fi
+        
+        curl -X POST -H 'Content-type: application/json' \
+             --data "{
+               \"text\": \"$EMOJI Czech Parliament ETL Pipeline $STATUS\",
+               \"blocks\": [
+                 {
+                   \"type\": \"section\",
+                   \"text\": {
+                     \"type\": \"mrkdwn\",
+                     \"text\": \"*Czech Parliament ETL Pipeline*\n*Status:* $STATUS\n*Trigger:* ${{ github.event_name }}\n*Repository:* ${{ github.repository }}\"
+                   }
+                 }
+               ]
+             }" \
+             "$SLACK_WEBHOOK"
