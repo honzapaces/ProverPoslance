@@ -1,7 +1,7 @@
 import asyncio
 import asyncpg
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from contextlib import asynccontextmanager
