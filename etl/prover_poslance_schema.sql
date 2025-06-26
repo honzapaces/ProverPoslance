@@ -239,9 +239,7 @@ CREATE TABLE data_sync_log (
     sync_status VARCHAR(20) DEFAULT 'running', -- 'running', 'completed', 'failed'
     error_message TEXT,
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    
-    INDEX(sync_type, started_at)
+    completed_at TIMESTAMP
 );
 
 -- Create indexes for performance
