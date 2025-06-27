@@ -63,7 +63,7 @@ CREATE TABLE persons (
     title_after VARCHAR(50),
     birth_date DATE,
     death_date DATE,
-    gender CHAR(1) CHECK (gender IN ('M', 'F')),
+    gender CHAR(1) CHECK (gender IN ('M', 'Ž')),
     full_name VARCHAR(255) GENERATED ALWAYS AS (
         COALESCE(title_before || ' ', '') || 
         first_name || ' ' || 

@@ -297,23 +297,30 @@ class ETLPipeline:
         await self.log_sync_complete(sync_id, result)
         return result
     
-    async def sync_persons_and_mps(self) -> SyncResult:
-        """Sync persons and MPs data from PSP"""
-        sync_id = await self.log_sync_start("persons_mps", "osoby.zip")
-        result = SyncResult("persons_mps", "osoby.zip")
+    async def sync_persons_and_mps(self, table_filters: Optional[List[str]] = None) -> SyncResult:
+        """Sync persons and MPs data from PSP
+        
+        Args:
+            table_filters: Optional list of specific tables to sync (e.g., ['osoby'] for persons only)
+        """
+        sync_id = await self.log_sync_start("persons_mps", "poslanci.zip")
+        result = SyncResult("persons_mps", "poslanci.zip")
         
         try:
-            # Fetch MP data
+            # Fetch MP data with optional filtering
             logger.info("Fetching MP data from PSP...")
-            mp_data = self.fetcher.fetch_mp_data()
+            if table_filters:
+                logger.info(f"Filtering tables: {table_filters}")
+            
+            mp_data = self.fetcher.fetch_mp_data(table_filters)
             
             # Cache the raw data
             await self.cache_data("latest_mp_data", mp_data)
             
             async with self.db.get_connection() as conn:
                 # Sync persons first
-                if 'osoba' in mp_data:
-                    for person_record in mp_data['osoba']:
+                if 'osoby' in mp_data:
+                    for person_record in mp_data['osoby']:
                         result.records_processed += 1
                         
                         try:
@@ -434,14 +441,22 @@ class ETLPipeline:
         await self.log_sync_complete(sync_id, result)
         return result
     
-    async def sync_voting_data(self, period: str = "hl-2021ps") -> SyncResult:
-        """Sync voting data for a specific electoral period"""
+    async def sync_voting_data(self, period: str = "hl-2021ps", table_filters: Optional[List[str]] = None) -> SyncResult:
+        """Sync voting data for a specific electoral period
+        
+        Args:
+            period: Electoral period identifier (e.g., 'hl-2021ps')
+            table_filters: Optional list of specific tables to sync (e.g., ['hl_hlasovani'] for sessions only)
+        """
         sync_id = await self.log_sync_start("voting_data", f"{period}.zip")
         result = SyncResult("voting_data", f"{period}.zip")
         
         try:
             logger.info(f"Fetching voting data for period {period}...")
-            voting_data = self.fetcher.fetch_voting_data(period)
+            if table_filters:
+                logger.info(f"Filtering tables: {table_filters}")
+            
+            voting_data = self.fetcher.fetch_voting_data(period, table_filters)
             
             # Cache the raw data
             await self.cache_data(f"latest_voting_data_{period}", voting_data)
@@ -573,14 +588,21 @@ class ETLPipeline:
         await self.log_sync_complete(sync_id, result)
         return result
     
-    async def sync_bills_data(self) -> SyncResult:
-        """Sync bills and documents data"""
+    async def sync_bills_data(self, table_filters: Optional[List[str]] = None) -> SyncResult:
+        """Sync bills and documents data
+        
+        Args:
+            table_filters: Optional list of specific tables to sync (e.g., ['tisk'] for bills only)
+        """
         sync_id = await self.log_sync_start("bills", "tisky.zip")
         result = SyncResult("bills", "tisky.zip")
         
         try:
             logger.info("Fetching bills data...")
-            bills_data = self.fetcher.fetch_bills_data()
+            if table_filters:
+                logger.info(f"Filtering tables: {table_filters}")
+            
+            bills_data = self.fetcher.fetch_bills_data(table_filters)
             
             # Cache the raw data
             await self.cache_data("latest_bills_data", bills_data)
@@ -687,6 +709,57 @@ class ETLPipeline:
         except Exception as e:
             logger.error(f"Error in full sync: {e}")
             raise
+    
+    async def run_test_sync(self, data_source: str, table_filters: Optional[List[str]] = None) -> SyncResult:
+        """Run a test sync on specific data source for troubleshooting
+        
+        Args:
+            data_source: Type of data to sync ('mp', 'voting', 'bills')
+            table_filters: Optional list of specific tables to sync
+        
+        Returns:
+            SyncResult for the test operation
+        """
+        logger.info(f"Running test sync for {data_source}...")
+        
+        if data_source == 'mp':
+            return await self.sync_persons_and_mps(table_filters)
+        elif data_source == 'voting':
+            return await self.sync_voting_data("hl-2021ps", table_filters)
+        elif data_source == 'bills':
+            return await self.sync_bills_data(table_filters)
+        else:
+            raise ValueError(f"Unknown data source: {data_source}")
+    
+    async def inspect_data_source(self, zip_filename: str) -> Dict[str, Any]:
+        """Inspect a data source without processing it
+        
+        Args:
+            zip_filename: Name of the ZIP file to inspect
+            
+        Returns:
+            Dictionary with inspection results
+        """
+        logger.info(f"Inspecting data source: {zip_filename}")
+        
+        contents = self.fetcher.inspect_zip_contents(zip_filename)
+        schemas = self.fetcher.list_available_schemas()
+        
+        inspection = {
+            'zip_filename': zip_filename,
+            'files': contents,
+            'available_schemas': {},
+            'missing_schemas': []
+        }
+        
+        for filename, size in contents.items():
+            table_name = filename.replace('.unl', '')
+            if table_name in schemas:
+                inspection['available_schemas'][table_name] = schemas[table_name]
+            else:
+                inspection['missing_schemas'].append(table_name)
+        
+        return inspection
     
     async def run_incremental_sync(self) -> Dict[str, SyncResult]:
         """Run incremental sync (daily updates)"""
@@ -909,9 +982,12 @@ async def main():
     
     parser = argparse.ArgumentParser(description="Czech Parliament ETL Pipeline")
     parser.add_argument("--database-url", required=True, help="PostgreSQL database URL")
-    parser.add_argument("--action", choices=['full-sync', 'incremental-sync', 'monitor', 'scheduler'], 
+    parser.add_argument("--action", choices=['full-sync', 'incremental-sync', 'monitor', 'scheduler', 'test-sync', 'inspect'], 
                        required=True, help="Action to perform")
     parser.add_argument("--sync-type", help="Specific sync type for monitoring")
+    parser.add_argument("--data-source", choices=['mp', 'voting', 'bills'], help="Data source for test-sync")
+    parser.add_argument("--tables", nargs='*', help="Specific tables to sync (e.g., osoby hl_hlasovani)")
+    parser.add_argument("--zip-file", help="ZIP file to inspect (e.g., poslanci.zip)")
     
     args = parser.parse_args()
     
@@ -983,6 +1059,64 @@ async def main():
             print("\nShutting down scheduler...")
         finally:
             await scheduler.shutdown()
+    
+    elif args.action == 'test-sync':
+        if not args.data_source:
+            print("Please specify --data-source (mp, voting, or bills)")
+            return
+        
+        pipeline = ETLPipeline(args.database_url)
+        try:
+            await pipeline.initialize()
+            
+            print(f"Running test sync for {args.data_source}...")
+            if args.tables:
+                print(f"Filtering tables: {args.tables}")
+            
+            result = await pipeline.run_test_sync(args.data_source, args.tables)
+            
+            print(f"\n=== Test Sync Results ===")
+            print(f"Status: {result.status.value}")
+            print(f"Processed: {result.records_processed}")
+            print(f"Inserted: {result.records_inserted}")
+            print(f"Updated: {result.records_updated}")
+            print(f"Failed: {result.records_failed}")
+            if result.error_message:
+                print(f"Error: {result.error_message}")
+        
+        finally:
+            await pipeline.shutdown()
+    
+    elif args.action == 'inspect':
+        if not args.zip_file:
+            print("Available ZIP files to inspect:")
+            print("  --zip-file poslanci.zip   # MP and person data")
+            print("  --zip-file tisky.zip      # Bills and documents")
+            print("  --zip-file hl-2021ps.zip # Voting data for 2021 period")
+            print("  --zip-file organy.zip     # Committees and organs")
+            return
+        
+        pipeline = ETLPipeline(args.database_url)
+        try:
+            await pipeline.initialize()
+            
+            inspection = await pipeline.inspect_data_source(args.zip_file)
+            
+            print(f"\n=== Inspection Results for {args.zip_file} ===")
+            print(f"Files found: {len(inspection['files'])}")
+            
+            for filename, size in inspection['files'].items():
+                print(f"  {filename}: {size:,} characters")
+            
+            print(f"\nTables with schemas: {len(inspection['available_schemas'])}")
+            for table, schema in inspection['available_schemas'].items():
+                print(f"  {table}: {len(schema)} fields")
+            
+            if inspection['missing_schemas']:
+                print(f"\nTables without schemas: {inspection['missing_schemas']}")
+        
+        finally:
+            await pipeline.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())

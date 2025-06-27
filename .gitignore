@@ -1,0 +1,4 @@
+etl/data_cache/latest_bills_data.json
+etl/data_cache/latest_mp_data.json
+etl/data_cache/latest_voting_data_hl-2021ps.json
+etl/__pycache__/parliament_parser.cpython-313.pyc
